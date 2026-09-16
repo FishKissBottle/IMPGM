@@ -1,0 +1,54 @@
+dataset:
+  name: fbp
+  splits:
+    train:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\FBP_TrainData_UrbanResidentialLand
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\FBP_TrainData_NoUrbanResidentialLand
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\FBP_TrainData_UrbanResidentialLandMask
+    valid:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\FBP_ValidData_UrbanResidentialLand
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\FBP_ValidData_NoUrbanResidentialLand
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\FBP_ValidData_UrbanResidentialLandMask
+    test:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\FBP_TestData_UrbanResidentialLand
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\FBP_TestData_NoUrbanResidentialLand
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\FBP_TestData_UrbanResidentialLandMask
+    draw:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\FBP_DrawData_UrbanResidentialLand
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\FBP_DrawData_NoUrbanResidentialLand
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\FBP_DrawData_UrbanResidentialLandMask
+  prompt_map:
+    NoUrbanResidentialLand: 0
+    UrbanResidentialLand: 1
+geometry:
+  input_channels: 4
+  mask_channels: 1
+  image_size: 256
+  latent_resolution: 64
+visualization:
+  vis_band_order:
+  - 2
+  - 1
+  - 0
+normalization:
+  image_mean:
+  - 0.22963959
+  - 0.20529941
+  - 0.18331511
+  - 0.34059314
+  image_std:
+  - 0.13062499
+  - 0.12794675
+  - 0.12931037
+  - 0.25767894
+latent:
+  scaling_factor: 1.81815559
+  scaling_factor_transfer: null

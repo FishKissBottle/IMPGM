@@ -1,0 +1,683 @@
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+import time
+import os
+
+from IMPGM_Config import *
+apply_task_config(globals(), FGGEN_DIFFUSION_CONFIG)
+from torch.utils.data import DataLoader
+from IMPGM_Dataset import IMPGM_Dataset
+from FgGen.FgGen_Code.FgGen_Diffusion import FgGen_Diffusion_UNet
+from FgGen.FgGen_Code.FgGen_Diffusion_Denoise import FgGen_Diffusion_Denoise
+import torch
+from torch import nn
+from tqdm import tqdm
+import torch.nn.functional as F
+from osgeo import gdal
+from IMPGM_Pixel_Losses import (
+    compute_timestep_gate,
+    fft_weighted_loss_pixel,
+    prepare_pixel_tensors,
+)
+from IMPGM_Utils import (
+    build_dataloader_generator,
+    build_ema_model,
+    build_scheduler,
+    build_torch_generator,
+    build_train_autocast,
+    encode_to_scaled_latent,
+    extract_diffusion_coefficient,
+    get_training_monitor_state,
+    iter_microbatch_slices,
+    load_model,
+    load_standard_vae,
+    log_info,
+    restore_rng_state,
+    resolve_microbatch_size,
+    save_model,
+    save_rgb_datas,
+    save_tif_datas,
+    seed_dataloader_worker,
+    set_random_seed,
+    slice_microbatch,
+    stash_rng_state,
+    training_monitor,
+    update_ema_model,
+    prepare_rgb_vis_tensor,
+    randn,
+)
+
+from IMPGM_Scheduler import build_beta_schedule
+from torch.utils.tensorboard import SummaryWriter
+
+gdal.UseExceptions()
+
+
+
+class DiffusionLossCalculator(nn.Module):
+    """Compute the training loss for the FgGen diffusion model."""
+    def __init__(self, model, beta_t, vae_model=None, latent_scaling_factor=1.0):
+        super().__init__()
+        self.model = model
+        self.T = len(beta_t)
+
+        # Store VAE in a list to avoid registering it as a submodule of the loss calculator.
+        self._vae_model = [vae_model]
+        self._latent_scaling_factor = latent_scaling_factor
+
+        self.register_buffer("beta_t", beta_t)
+
+        alpha_t = 1.0 - self.beta_t
+        alpha_t_bar = torch.cumprod(alpha_t, dim=0)
+
+        self.register_buffer("signal_rate", torch.sqrt(alpha_t_bar))
+        self.register_buffer("noise_rate", torch.sqrt(1.0 - alpha_t_bar))
+
+    def _compute_pixel_losses(self, pred_x_0_latent, x_0_latent, t):
+        vae_model = self._vae_model[0]
+        if vae_model is None:
+            raise ValueError("VAE model is required for pixel-space auxiliary losses.")
+
+        pred_pixel, target_pixel = prepare_pixel_tensors(
+            vae_model,
+            pred_x_0_latent,
+            x_0_latent,
+            self._latent_scaling_factor,
+        )
+
+        loss_fft_per = fft_weighted_loss_pixel(
+            pred_pixel, target_pixel, freq_power=LOSS_FREQ_POWER
+        )
+
+        gate = compute_timestep_gate(t, self.T)
+        loss_fft = (loss_fft_per * gate).mean()
+
+        return loss_fft
+
+    def forward(self, x_0, prompt_str):
+        t = torch.randint(self.T, size=(x_0.shape[0],), device=x_0.device)
+
+        epsilon = torch.randn_like(x_0)
+
+        x_t = (extract_diffusion_coefficient(self.signal_rate, t, x_0.shape) * x_0 + extract_diffusion_coefficient(self.noise_rate, t, x_0.shape) * epsilon)
+
+        v_t = extract_diffusion_coefficient(self.signal_rate, t, x_0.shape) * epsilon - extract_diffusion_coefficient(self.noise_rate, t, x_0.shape) * x_0
+
+        pred_v_t = self.model(x_t, t, prompt_str)
+
+        pred_x_0 = (extract_diffusion_coefficient(self.signal_rate, t, x_0.shape) * x_t - extract_diffusion_coefficient(self.noise_rate, t, x_0.shape) * pred_v_t) / (extract_diffusion_coefficient(self.signal_rate, t, x_0.shape) ** 2 + extract_diffusion_coefficient(self.noise_rate, t, x_0.shape) ** 2)
+
+        loss_fft = self._compute_pixel_losses(pred_x_0, x_0, t)
+
+        sp_loss = F.mse_loss(pred_v_t, v_t)
+        loss = sp_loss + loss_fft * FREQUENCY_LOSS_WEIGHT
+
+        return loss, sp_loss, loss_fft
+
+
+
+def train(
+    data_loader, Latent_model, optimizer, loss_calculator,
+    latent_scaling_factor, ema_model=None, training_state=None,
+    benchmark_recorder=None,
+):
+
+    train_loss_sum = 0.
+    train_sp_loss_sum = 0.
+    train_fq_loss_sum = 0.
+    train_sample_count = 0
+    with tqdm(data_loader, dynamic_ncols=False, colour="#ff924a", leave=False, ncols=120) as data:
+        for labs, fg_imgs, _, _, _, _ in data:
+            if benchmark_recorder is not None:
+                benchmark_recorder.before_step((labs, fg_imgs))
+            batch_size = fg_imgs.shape[0]
+            microbatch_size = resolve_microbatch_size(DIFFUSION_TRAIN_MICROBATCH_SIZE, batch_size)
+            optimizer.zero_grad(set_to_none=True)
+            batch_loss_sum = 0.0
+            batch_sp_loss_sum = 0.0
+            batch_fq_loss_sum = 0.0
+            for mb_start, mb_end in iter_microbatch_slices(batch_size, microbatch_size):
+                mb = int(mb_end - mb_start)
+                microbatch_weight = float(mb) / float(batch_size)
+                fg_imgs_mb = slice_microbatch(fg_imgs, mb_start, mb_end).to(
+                    DEVICE,
+                    non_blocking=DATA_TRANSFER_NON_BLOCKING,
+                )
+                labs_mb = slice_microbatch(labs, mb_start, mb_end)
+                with build_train_autocast():
+                    fg_imgs_e = encode_to_scaled_latent(Latent_model, fg_imgs_mb, latent_scaling_factor)
+                    loss, sp_loss, fq_loss = loss_calculator(fg_imgs_e, labs_mb)
+
+                (loss * microbatch_weight).backward()
+                batch_loss_sum += loss.item() * mb
+                batch_sp_loss_sum += sp_loss.item() * mb
+                batch_fq_loss_sum += fq_loss.item() * mb
+            optimizer.step()
+            if ema_model is not None:
+                update_ema_model(ema_model, loss_calculator.model, EMA_DECAY)
+
+            batch_loss = batch_loss_sum / batch_size
+            batch_sp_loss = batch_sp_loss_sum / batch_size
+            batch_fq_loss = batch_fq_loss_sum / batch_size
+
+            train_loss_sum += batch_loss_sum
+            train_sp_loss_sum += batch_sp_loss_sum
+            train_fq_loss_sum += batch_fq_loss_sum
+            train_sample_count += batch_size
+
+            if training_state is not None:
+                training_state['iteration'] += 1
+                if (
+                    benchmark_recorder is not None
+                    and benchmark_recorder.after_step()
+                ):
+                    return train_loss_sum / train_sample_count, train_sp_loss_sum / train_sample_count, train_fq_loss_sum / train_sample_count
+                if TRAIN_MAX_ITERATIONS > 0 and training_state['iteration'] >= TRAIN_MAX_ITERATIONS:
+                    training_state['max_iter_reached'] = True
+                    return train_loss_sum / train_sample_count, train_sp_loss_sum / train_sample_count, train_fq_loss_sum / train_sample_count
+
+            data.set_postfix(ordered_dict={
+                'loss':    f'{batch_loss:.6f}',
+                'sp_loss': f'{batch_sp_loss:.6f}',
+                'fq_loss': f'{batch_fq_loss:.6f}',
+            })
+
+    return train_loss_sum / train_sample_count, train_sp_loss_sum / train_sample_count, train_fq_loss_sum / train_sample_count
+
+
+def benchmark_training_memory(
+    *, output, warmup_steps=5, measure_steps=20, batch_size=1,
+    seed=999, overwrite=False,
+):
+    """Measure the formal FgGen diffusion training path without saving."""
+    from Evaluation.Evaluation_Code.IMPGM_Training_Memory_Evaluation import (
+        TrainingMemoryRecorder,
+    )
+
+    set_random_seed(int(seed), deterministic=False)
+    diffusion_model = FgGen_Diffusion_UNet(
+        ch=MODEL_CH,
+        out_ch=MODEL_OUT_CH,
+        ch_mult=MODEL_CH_MULT,
+        attn_resolutions=MODEL_ATTN_RESOLUTIONS,
+        dropout=MODEL_DROPOUT,
+        resamp_with_conv=MODEL_RESAMP_WITH_CONV,
+        in_channels=MODEL_IN_CHANNELS,
+        resolution=MODEL_RESOLUTION,
+        prompt_dict=PROMPT_DICT,
+    ).to(DEVICE)
+    optimizer = torch.optim.Adam(
+        diffusion_model.parameters(), lr=LEARNING_RATE, betas=ADAM_BETAS
+    )
+    beta_t = build_beta_schedule(
+        scheduler_type=SCHEDULER_TYPE,
+        timesteps=STEPS,
+        power_val=SCHEDULER_POWER_VAL,
+        min_beta=SCHEDULER_MIN_BETA,
+        max_beta=SCHEDULER_MAX_BETA,
+        cosine_s=SCHEDULER_COSINE_S,
+        sigmoid_start=SCHEDULER_SIGMOID_START,
+        sigmoid_end=SCHEDULER_SIGMOID_END,
+    )
+    latent_model, latent_scaling_factor, _ = load_standard_vae(
+        VAE_MODEL_SAVEPATH, device=DEVICE, load_ema=True
+    )
+    latent_model.eval()
+    for parameter in latent_model.parameters():
+        parameter.requires_grad = False
+    loss_calculator = DiffusionLossCalculator(
+        diffusion_model,
+        beta_t,
+        vae_model=latent_model,
+        latent_scaling_factor=latent_scaling_factor,
+    ).to(DEVICE)
+    _maybe_preload_weights(diffusion_model)
+    ema_model = build_ema_model(diffusion_model)
+    dataset_dict = DATASET_DICT
+    if dataset_dict is None:
+        raise RuntimeError("DATASET_DICT must not be None.")
+    train_images = sorted(
+        dataset_dict['img_rootdir_list_forTrain'], key=lambda path: 'No' in path
+    )
+    train_dataset = IMPGM_Dataset(
+        img_rootdir_list=train_images,
+        msk_rootdir_list=dataset_dict['msk_rootdir_list_forTrain'],
+        is_train=True,
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=int(batch_size),
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+        worker_init_fn=seed_dataloader_worker,
+        generator=build_dataloader_generator(int(seed)),
+    )
+    recorder = TrainingMemoryRecorder(
+        method_key="impgm",
+        stage="fggen_diffusion_training",
+        output=output,
+        warmup_steps=warmup_steps,
+        measure_steps=measure_steps,
+        batch_size=batch_size,
+        seed=seed,
+        overwrite=overwrite,
+        precision="formal build_train_autocast configuration",
+    )
+    recorder.bind_trainable_modules([diffusion_model])
+    train(
+        train_loader,
+        latent_model,
+        optimizer,
+        loss_calculator,
+        latent_scaling_factor,
+        ema_model=ema_model,
+        training_state={"iteration": 0, "max_iter_reached": False},
+        benchmark_recorder=recorder,
+    )
+    return recorder.finish()
+
+
+
+def valid(data_loader, Latent_model, loss_calculator, latent_scaling_factor):
+
+    valid_loss_sum = 0.
+    valid_sp_loss_sum = 0.
+    valid_fq_loss_sum = 0.
+    valid_sample_count = 0
+    with torch.no_grad():
+        for labs, fg_imgs, _, _, _, _ in data_loader:
+            batch_size = fg_imgs.shape[0]
+            microbatch_size = resolve_microbatch_size(DIFFUSION_VALID_MICROBATCH_SIZE, batch_size)
+            for mb_start, mb_end in iter_microbatch_slices(batch_size, microbatch_size):
+                mb = int(mb_end - mb_start)
+                fg_imgs_mb = slice_microbatch(fg_imgs, mb_start, mb_end).to(
+                    DEVICE,
+                    non_blocking=DATA_TRANSFER_NON_BLOCKING,
+                )
+                labs_mb = slice_microbatch(labs, mb_start, mb_end)
+                with build_train_autocast():
+                    fg_imgs_e = encode_to_scaled_latent(Latent_model, fg_imgs_mb, latent_scaling_factor)
+                    loss, sp_loss, fq_loss = loss_calculator(fg_imgs_e, labs_mb)
+
+                valid_loss_sum += loss.item() * mb
+                valid_sp_loss_sum += sp_loss.item() * mb
+                valid_fq_loss_sum += fq_loss.item() * mb
+                valid_sample_count += mb
+
+    return valid_loss_sum / valid_sample_count, valid_sp_loss_sum / valid_sample_count, valid_fq_loss_sum / valid_sample_count
+
+
+
+def _maybe_preload_weights(model):
+    """Optionally initialize FgGen diffusion weights from a checkpoint."""
+    if not PRELOAD_ENABLED:
+        return
+    if not PRELOAD_SOURCE_PATH:
+        raise ValueError("FgGen diffusion preloading is enabled but source_path is empty.")
+    if not Path(PRELOAD_SOURCE_PATH).is_file():
+        raise FileNotFoundError(f"FgGen diffusion preload source not found: {PRELOAD_SOURCE_PATH}")
+    load_model(
+        PRELOAD_SOURCE_PATH,
+        model=model,
+        optimizer=None,
+        scheduler=None,
+        resume_training=True,
+        preload_only=True,
+        skip_prefix=PRELOAD_SKIP_PREFIX or None,
+        load_ema=False,
+        strict=False,
+        map_location=DEVICE,
+    )
+
+
+_DRAW_LABS_MAP = {
+    'main':   ('Water', 'Water', 'FewCloud', 'LessCloud', 'MoreCloud', 'ManyCloud'),
+    'fbp':    ('NoUrbanResidentialLand', 'NoUrbanResidentialLand', 'NoUrbanResidentialLand', 'UrbanResidentialLand', 'UrbanResidentialLand', 'UrbanResidentialLand'),
+    'loveda': ('NoAgriculture', 'NoAgriculture', 'NoAgriculture', 'Agriculture', 'Agriculture', 'Agriculture'),
+    'sfq2019':('NoPaddy', 'NoPaddy', 'NoPaddy', 'Paddy', 'Paddy', 'Paddy'),
+}
+
+
+def _build_draw_labels():
+    if DATASET_NAME in _DRAW_LABS_MAP:
+        return _DRAW_LABS_MAP[DATASET_NAME]
+    if PROMPT_DICT is not None and len(PROMPT_DICT) == 2:
+        sorted_items = sorted(PROMPT_DICT.items(), key=lambda x: x[1])
+        return (sorted_items[0][0],) * 3 + (sorted_items[1][0],) * 3
+    if PROMPT_DICT:
+        keys = [k for k, _ in sorted(PROMPT_DICT.items(), key=lambda x: x[1])]
+        return tuple(keys * (6 // max(len(keys), 1) + 1))[:6]
+    return _DRAW_LABS_MAP['main']
+
+
+@torch.no_grad()
+def _draw_fggen_diffusion_microbatched(draw_labs, diffusion_model, vae_model):
+    """Generate fixed-noise draw samples from the in-memory EMA model."""
+    batch_size = len(draw_labs)
+    microbatch_size = resolve_microbatch_size(DIFFUSION_DRAW_MICROBATCH_SIZE, batch_size)
+    draw_outputs = []
+    rng_state = stash_rng_state()
+    try:
+        set_random_seed(DRAW_RANDOM_SEED, deterministic=False)
+        generator = build_torch_generator(DRAW_RANDOM_SEED, DEVICE)
+        initial_noise = randn(
+            (batch_size, LATENT_HIDDENCHANNEL, LATENT_RESOLUTION, LATENT_RESOLUTION),
+            device=DEVICE,
+            generator=generator,
+        )
+        for mb_start, mb_end in iter_microbatch_slices(batch_size, microbatch_size):
+            draw_outputs.append(
+                FgGen_Diffusion_Denoise(
+                    sampler_mode=DRAW_SAMPLER_MODE,
+                    prompt_str=slice_microbatch(draw_labs, mb_start, mb_end),
+                    rgb_save_path=None,
+                    tif_save_path=None,
+                    seed=DRAW_RANDOM_SEED + mb_start,
+                    diffusion_model=diffusion_model,
+                    vae_model=vae_model,
+                    initial_noise=initial_noise[mb_start:mb_end],
+                )
+            )
+    finally:
+        restore_rng_state(rng_state)
+    return torch.cat(draw_outputs, dim=0)
+
+
+def main(resume_train=False):
+    if TASK_NAME != "fggen_diffusion":
+        raise RuntimeError(
+            f"FgGen_Diffusion_Train requires fggen_diffusion.yaml, got {TASK_NAME!r}"
+        )
+    set_random_seed(RANDOM_SEED, deterministic=False)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(RGB_DIR, exist_ok=True)
+    os.makedirs(TIF_DIR, exist_ok=True)
+
+    writer = SummaryWriter(LOG_DIR)
+
+    if os.path.exists(MODEL_SAVEPATH) and not resume_train:
+        raise Exception('FGGEN_DIFFUSION_MODEL exists and resume_train is False ^_^')
+
+    FgGen_Diffusion_model = FgGen_Diffusion_UNet(
+        ch=MODEL_CH,
+        out_ch=MODEL_OUT_CH,
+        ch_mult=MODEL_CH_MULT,
+        attn_resolutions=MODEL_ATTN_RESOLUTIONS,
+        dropout=MODEL_DROPOUT,
+        resamp_with_conv=MODEL_RESAMP_WITH_CONV,
+        in_channels=MODEL_IN_CHANNELS,
+        resolution=MODEL_RESOLUTION,
+        prompt_dict=PROMPT_DICT,
+    ).to(DEVICE)
+
+    optimizer = torch.optim.Adam(
+        FgGen_Diffusion_model.parameters(),
+        lr=LEARNING_RATE,
+        betas=ADAM_BETAS,
+    )
+
+    beta_t = build_beta_schedule(
+        scheduler_type=SCHEDULER_TYPE,
+        timesteps=STEPS,
+        power_val=SCHEDULER_POWER_VAL,
+        min_beta=SCHEDULER_MIN_BETA,
+        max_beta=SCHEDULER_MAX_BETA,
+        cosine_s=SCHEDULER_COSINE_S,
+        sigmoid_start=SCHEDULER_SIGMOID_START,
+        sigmoid_end=SCHEDULER_SIGMOID_END,
+    )
+
+    Latent_model, latent_scaling_factor, _ = load_standard_vae(VAE_MODEL_SAVEPATH, device=DEVICE, load_ema=True)
+    Latent_model.eval()
+    for param in Latent_model.parameters():
+        param.requires_grad = False
+
+    loss_calculator = DiffusionLossCalculator(
+        FgGen_Diffusion_model,
+        beta_t,
+        vae_model=Latent_model,
+        latent_scaling_factor=latent_scaling_factor,
+    ).to(DEVICE)
+    lr_scheduler = build_scheduler(optimizer, MIN_LEARNING_RATE, PATIENCE_THRESHOLD_NUM)
+    if not resume_train:
+        _maybe_preload_weights(FgGen_Diffusion_model)
+    ema_model = build_ema_model(FgGen_Diffusion_model)
+    resume_extra = {}
+
+    if resume_train:
+        FgGen_Diffusion_model, optimizer, lr_scheduler, last_epoch, last_loss_dict, resume_extra, _ = load_model(
+            MODEL_SAVEPATH,
+            FgGen_Diffusion_model,
+            optimizer,
+            scheduler=lr_scheduler,
+            resume_training=True,
+            preload_only=False,
+            ema_model=ema_model,
+            ema_decay=EMA_DECAY,
+            map_location=DEVICE,
+        )
+        start_epoch = max(int(last_epoch), 0)
+    else:
+        start_epoch = 0
+
+    dataset_dict = DATASET_DICT
+    if dataset_dict is None:
+        raise Exception("DATASET_DICT must not be None.")
+
+    img_rootdir_list_forTrain = dataset_dict['img_rootdir_list_forTrain']
+    img_rootdir_list_forTrain.sort(key=lambda x: 'No' in x)
+    msk_rootdir_list_forTrain = dataset_dict['msk_rootdir_list_forTrain']
+
+    img_rootdir_list_forValid = dataset_dict['img_rootdir_list_forValid']
+    img_rootdir_list_forValid.sort(key=lambda x: 'No' in x)
+    msk_rootdir_list_forValid = dataset_dict['msk_rootdir_list_forValid']
+
+    train_dataset = IMPGM_Dataset(img_rootdir_list=img_rootdir_list_forTrain, msk_rootdir_list=msk_rootdir_list_forTrain, is_train=True)
+    train_generator = build_dataloader_generator(RANDOM_SEED)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=TRAIN_BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+        worker_init_fn=seed_dataloader_worker,
+        generator=train_generator,
+    )
+
+    valid_dataset = IMPGM_Dataset(img_rootdir_list=img_rootdir_list_forValid, msk_rootdir_list=msk_rootdir_list_forValid, is_train=False)
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=VALID_BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+        worker_init_fn=seed_dataloader_worker,
+        generator=build_dataloader_generator(RANDOM_SEED + 1),
+    )
+
+    draw_labs = _build_draw_labels()
+
+    FgGen_Diffusion_model.train()
+    training_state = {
+        "iteration": int(
+            resume_extra.get("global_iteration", start_epoch * len(train_loader))
+        ),
+        "max_iter_reached": False,
+    }
+
+    for epoch_idx in range(start_epoch, TRAIN_MAX_EPOCHS):
+        epoch_num = epoch_idx + 1
+        train_generator.manual_seed(RANDOM_SEED + epoch_idx)
+        global current_lr
+        for param_group in optimizer.param_groups:
+            current_lr = param_group['lr']
+
+        if resume_train and epoch_idx == start_epoch:
+            fallback_best_epoch_idx = max(last_epoch - 1, 0)
+            best_epoch_num_raw = resume_extra.get(
+                "best_epoch_num",
+                last_loss_dict.get("best_epoch_num"),
+            )
+            resume_best_epoch_idx = (
+                max(int(best_epoch_num_raw) - 1, 0)
+                if best_epoch_num_raw is not None
+                else fallback_best_epoch_idx
+            )
+            load_dict = {
+                'min_loss': last_loss_dict.get(
+                    'min_loss',
+                    last_loss_dict.get('valid_loss', float('inf')),
+                ),
+                'best_epoch_idx': resume_best_epoch_idx,
+                'patience_counter': int(
+                    resume_extra.get(
+                        'patience_counter',
+                        last_loss_dict.get('patience_counter', 0),
+                    )
+                ),
+                'patience_counter_after_min_lr': int(
+                    resume_extra.get(
+                        'patience_counter_after_min_lr',
+                        last_loss_dict.get('patience_counter_after_min_lr', 0),
+                    )
+                ),
+            }
+            is_break_training, is_savemodel, patience_counter, patience_counter_after_min_lr = training_monitor(
+                epoch_idx, MIN_LEARNING_RATE, current_lr, float('inf'), PATIENCE_THRESHOLD_NUM, resume_train=resume_train, load_dict=load_dict)
+            train_loss, train_sp_loss, train_fq_loss = train(
+                train_loader, Latent_model, optimizer, loss_calculator, latent_scaling_factor, ema_model=ema_model, training_state=training_state)
+            eval_rng_state = stash_rng_state()
+            if DETERMINISTIC_EVAL:
+                set_random_seed(RANDOM_SEED, deterministic=False)
+            ema_model.eval()
+            loss_calculator.model = ema_model
+            valid_loss, valid_sp_loss, valid_fq_loss = valid(valid_loader, Latent_model, loss_calculator, latent_scaling_factor)
+            loss_calculator.model = FgGen_Diffusion_model
+            restore_rng_state(eval_rng_state)
+            FgGen_Diffusion_model.train()
+            is_break_training, is_savemodel, patience_counter, patience_counter_after_min_lr = training_monitor(
+                epoch_idx, MIN_LEARNING_RATE, current_lr, valid_loss, PATIENCE_THRESHOLD_NUM, resume_train=False, load_dict=None)
+        else:
+            train_loss, train_sp_loss, train_fq_loss = train(
+                train_loader, Latent_model, optimizer, loss_calculator, latent_scaling_factor, ema_model=ema_model, training_state=training_state)
+            eval_rng_state = stash_rng_state()
+            if DETERMINISTIC_EVAL:
+                set_random_seed(RANDOM_SEED, deterministic=False)
+            ema_model.eval()
+            loss_calculator.model = ema_model
+            valid_loss, valid_sp_loss, valid_fq_loss = valid(valid_loader, Latent_model, loss_calculator, latent_scaling_factor)
+            loss_calculator.model = FgGen_Diffusion_model
+            restore_rng_state(eval_rng_state)
+            FgGen_Diffusion_model.train()
+            is_break_training, is_savemodel, patience_counter, patience_counter_after_min_lr = training_monitor(
+                epoch_idx, MIN_LEARNING_RATE, current_lr, valid_loss, PATIENCE_THRESHOLD_NUM, resume_train=False, load_dict=None)
+
+        lr_scheduler.step(valid_loss)
+        monitor_state = get_training_monitor_state()
+
+        _tag_prefix = EXP_NAME
+        writer.add_scalars('FgGen_Diffusion/train_loss',    {f"{_tag_prefix}_train_loss": train_loss},       epoch_num)
+        writer.add_scalars('FgGen_Diffusion/train_sp_loss', {f"{_tag_prefix}_train_sp_loss": train_sp_loss}, epoch_num)
+        writer.add_scalars('FgGen_Diffusion/train_fq_loss', {f"{_tag_prefix}_train_fq_loss": train_fq_loss}, epoch_num)
+        writer.add_scalars('FgGen_Diffusion/valid_loss',    {f"{_tag_prefix}_valid_loss": valid_loss},       epoch_num)
+        writer.add_scalars('FgGen_Diffusion/valid_sp_loss', {f"{_tag_prefix}_valid_sp_loss": valid_sp_loss}, epoch_num)
+        writer.add_scalars('FgGen_Diffusion/valid_fq_loss', {f"{_tag_prefix}_valid_fq_loss": valid_fq_loss}, epoch_num)
+
+        print(f'   Epoch: {epoch_num}, Iteration: {training_state["iteration"]}, Pc: {patience_counter}, Pc_min_lr: {patience_counter_after_min_lr}, Lr: {current_lr:.8f}, Train_Loss: {train_loss:.6f}, Valid_Loss: {valid_loss:.6f}, Valid_Sp_loss: {valid_sp_loss:.6f}, Valid_Fq_loss: {valid_fq_loss:.6f}')
+
+        log_info(log_path=TRAIN_INFO_PATH,
+            text=f'>>> Epoch: {epoch_num}, Pc: {patience_counter}, Pc_min_lr: {patience_counter_after_min_lr}, Lr: {current_lr:.8f}, Train_Loss: {train_loss:.6f}, Valid_Loss: {valid_loss:.6f}, Valid_Sp_loss: {valid_sp_loss:.6f}, Valid_Fq_loss: {valid_fq_loss:.6f}')
+        if epoch_num % DRAW_INTERVAL_EPOCHS != 0:
+            log_info(log_path=TRAIN_INFO_PATH, text='')
+
+        if is_savemodel or epoch_num % TIF_INTERVAL_EPOCHS == 0:
+            loss_dict = {
+                'train_loss': train_loss,
+                'valid_loss': valid_loss,
+                'min_loss': monitor_state['min_loss'],
+            }
+            save_model(
+                MODEL_SAVEPATH,
+                epoch_num,
+                model=FgGen_Diffusion_model,
+                optimizer=optimizer,
+                scheduler=lr_scheduler,
+                loss_dict=loss_dict,
+                extra={
+                    **PRELOAD_METADATA,
+                    'ema_model_state_dict': ema_model.state_dict(),
+                    'ema_decay': EMA_DECAY,
+                    'best_epoch_num': int(monitor_state['best_epoch_idx']) + 1,
+                    'patience_counter': monitor_state['patience_counter'],
+                    'patience_counter_after_min_lr': monitor_state['patience_counter_after_min_lr'],
+                    'latent_scaling_factor': latent_scaling_factor,
+                    'global_iteration': int(training_state['iteration']),
+                    'random_seed': RANDOM_SEED,
+                },
+            )
+
+        if epoch_num in EXTRA_MODEL_SAVE_EPOCH_NUM:
+            loss_dict = {
+                'train_loss': train_loss,
+                'valid_loss': valid_loss,
+                'min_loss': monitor_state['min_loss'],
+            }
+            save_model(
+                MODEL_SAVEPATH.replace('.pth', '') + f'_{epoch_num}e.pth',
+                epoch_num,
+                model=FgGen_Diffusion_model,
+                optimizer=optimizer,
+                scheduler=lr_scheduler,
+                loss_dict=loss_dict,
+                extra={
+                    **PRELOAD_METADATA,
+                    'ema_model_state_dict': ema_model.state_dict(),
+                    'ema_decay': EMA_DECAY,
+                    'best_epoch_num': int(monitor_state['best_epoch_idx']) + 1,
+                    'patience_counter': monitor_state['patience_counter'],
+                    'patience_counter_after_min_lr': monitor_state['patience_counter_after_min_lr'],
+                    'latent_scaling_factor': latent_scaling_factor,
+                    'global_iteration': int(training_state['iteration']),
+                    'random_seed': RANDOM_SEED,
+                },
+            )
+
+        if epoch_num % DRAW_INTERVAL_EPOCHS == 0:
+            print(f'   FgGen_Diffusion at epoch: {epoch_num} --- labels: {draw_labs}')
+            ema_model.eval()
+            Denoised_Fg_Imgs = _draw_fggen_diffusion_microbatched(
+                draw_labs,
+                diffusion_model=ema_model,
+                vae_model=Latent_model,
+            )
+
+            save_rgb_datas(prepare_rgb_vis_tensor(Denoised_Fg_Imgs).cpu(), nrow=3,
+                           savepath=os.path.join(RGB_DIR, f'Diffusion_RGBs_{epoch_num}.png'),
+                           is_showminmax=True)
+
+            if SAVE_TIF_IMAGES and epoch_num % TIF_INTERVAL_EPOCHS == 0:
+                save_tif_datas(Denoised_Fg_Imgs, projections=None, geotransforms=None,
+                               savepath=os.path.join(TIF_DIR, f'Diffusion_TIFs_{epoch_num}.tif'),
+                               is_showminmax=True)
+
+        if training_state['max_iter_reached']:
+            print(f"Reached TRAIN_MAX_ITERATIONS ({TRAIN_MAX_ITERATIONS}), stopping training.")
+            break
+
+        if is_break_training:
+            break
+
+        time.sleep(5)
+
+    writer.close()
+
+
+if __name__ == '__main__':
+    
+    main(resume_train=True)

@@ -1,0 +1,46 @@
+# =============================================================================
+# ImgSyn Diffusion Task Configuration
+# =============================================================================
+
+diffusion:
+  unet:
+    ch: 96
+    ch_mult: [1, 2, 3, 4]
+    attn_resolutions: [8, 16, 32, 64]
+    dropout: 0.0
+    resamp_with_conv: true
+    resolution: 64
+    in_channels: 8
+    out_channels: 8
+
+  scheduler:
+    type: cosine
+    cosine:
+      min_beta: 1.0e-4
+      max_beta: 0.999
+      offset: 0.008
+    linear:
+      min_beta: 1.0e-4
+      max_beta: 0.01
+    power:
+      min_beta: 1.0e-4
+      max_beta: 0.999
+      exponent: 3
+    sigmoid:
+      min_beta: 1.0e-4
+      max_beta: 0.999
+      start: -12.0
+      end: -2.0
+
+  sampling:
+    steps: 1000
+
+  losses:
+    frequency_weight: 1000.0
+    freq_power: 1.0
+
+  preload:
+    enabled: false
+    source_dataset: main
+    source_path: "ImgSyn/ImgSyn_Diffusion_Models_SaveFolder/main/ImgSyn_Diffusion_main_cosine.pth"
+    skip_prefix: "prompt_embd_attn"

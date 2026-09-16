@@ -1,0 +1,51 @@
+dataset:
+  name: loveda
+  splits:
+    train:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\LoveDA_TrainData_Agriculture
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\LoveDA_TrainData_NoAgriculture
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\LoveDA_TrainData_AgricultureMask
+    valid:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\LoveDA_ValidData_Agriculture
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\LoveDA_ValidData_NoAgriculture
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\LoveDA_ValidData_AgricultureMask
+    test:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\LoveDA_TestData_Agriculture
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\LoveDA_TestData_NoAgriculture
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\LoveDA_TestData_AgricultureMask
+    draw:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\LoveDA_DrawData_Agriculture
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\LoveDA_DrawData_AgricultureMask
+  prompt_map:
+    NoAgriculture: 0
+    Agriculture: 1
+geometry:
+  input_channels: 3
+  mask_channels: 1
+  image_size: 256
+  latent_resolution: 64
+visualization:
+  vis_band_order:
+  - 2
+  - 1
+  - 0
+normalization:
+  image_mean:
+  - 0.30317698
+  - 0.3170581
+  - 0.29436287
+  image_std:
+  - 0.12703304
+  - 0.13432673
+  - 0.15343892
+latent:
+  scaling_factor: 2.20282529
+  scaling_factor_transfer: null

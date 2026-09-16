@@ -1,0 +1,89 @@
+dataset:
+  name: main
+  splits:
+    train:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TrainData_Water
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TrainData_FewCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TrainData_LessCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TrainData_MoreCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TrainData_ManyCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TrainData_NoCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TrainData_NoObj
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TrainData_WaterMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TrainData_FewCloudMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TrainData_LessCloudMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TrainData_MoreCloudMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TrainData_ManyCloudMask
+    valid:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_ValidData_Water
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_ValidData_FewCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_ValidData_LessCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_ValidData_MoreCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_ValidData_ManyCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_ValidData_NoCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_ValidData_NoObj
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_ValidData_WaterMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_ValidData_FewCloudMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_ValidData_LessCloudMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_ValidData_MoreCloudMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_ValidData_ManyCloudMask
+    test:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TestData_Water
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TestData_FewCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TestData_LessCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TestData_MoreCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TestData_ManyCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TestData_NoCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TestData_NoObj
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TestData_WaterMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TestData_FewCloudMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TestData_LessCloudMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TestData_MoreCloudMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_TestData_ManyCloudMask
+    draw:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_DrawData_Water
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_DrawData_Cloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_DrawData_NoCloud
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_DrawData_NoObj
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_DrawData_WaterMask
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_TrainTestDataSet\DBL_DrawData_CloudMask
+  prompt_map:
+    NoObj: 0
+    Water: 1
+    NoCloud: 2
+    FewCloud: 3
+    LessCloud: 4
+    MoreCloud: 5
+    ManyCloud: 6
+geometry:
+  input_channels: 4
+  mask_channels: 1
+  image_size: 256
+  latent_resolution: 64
+visualization:
+  vis_band_order:
+  - 2
+  - 1
+  - 0
+normalization:
+  image_mean:
+  - 0.14954015
+  - 0.13797923
+  - 0.1334973
+  - 0.24937906
+  image_std:
+  - 0.11021983
+  - 0.11065489
+  - 0.12535671
+  - 0.14174282
+latent:
+  scaling_factor: 1.99103535
+  scaling_factor_transfer: null

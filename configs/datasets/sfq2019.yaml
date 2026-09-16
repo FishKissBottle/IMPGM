@@ -1,0 +1,54 @@
+dataset:
+  name: sfq2019
+  splits:
+    train:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\SFQ2019_TrainData_Paddy
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\SFQ2019_TrainData_NoPaddy
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\SFQ2019_TrainData_PaddyMsk
+    valid:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\SFQ2019_ValidData_Paddy
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\SFQ2019_ValidData_NoPaddy
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\SFQ2019_ValidData_PaddyMsk
+    test:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\SFQ2019_TestData_Paddy
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\SFQ2019_TestData_NoPaddy
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\SFQ2019_TestData_PaddyMsk
+    draw:
+      image_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\SFQ2019_DrawData_Paddy
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\SFQ2019_DrawData_NoPaddy
+      mask_roots:
+      - E:\Global_Water_Extraction\Pix2Pix_Code\DBL_PreLoadDataSet\SFQ2019_DrawData_PaddyMsk
+  prompt_map:
+    NoPaddy: 0
+    Paddy: 1
+geometry:
+  input_channels: 4
+  mask_channels: 1
+  image_size: 256
+  latent_resolution: 64
+visualization:
+  vis_band_order:
+  - 2
+  - 1
+  - 0
+normalization:
+  image_mean:
+  - 0.18659829
+  - 0.16006142
+  - 0.13122488
+  - 0.17302788
+  image_std:
+  - 0.02964666
+  - 0.03316444
+  - 0.04152543
+  - 0.08238273
+latent:
+  scaling_factor: 1.83070606
+  scaling_factor_transfer: 1.85952717
